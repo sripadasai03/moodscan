@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MoodScan</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+
+  body {
+    background:#000;
+    width:100vw; height:100vh;
+    overflow:hidden;
+    display:flex;
+    flex-direction:row;
+    align-items:center;
+    justify-content:center;
+    gap:clamp(8px, 1vw, 20px);
+  }
+
+  .panel {
+    position:relative;
+    height: min(90vh, 48vw * 9 / 16);
+    width: min(48vw, 90vh * 16 / 9);
+    aspect-ratio: 16/9;
+    overflow:hidden;
+    background:#000;
+    flex-shrink:0;
+  }
+
+  #videoEl {
+    width:100%; height:100%;
+    object-fit:cover;
+    transform:scaleX(-1);
+    display:block;
+  }
+
+  #overlayCanvas {
+    position:absolute; top:0; left:0;
+    width:100%; height:100%;
+    pointer-events:none;
+    transform:scaleX(-1);
+  }
+
+  #moodTag {
+    position:absolute; top:10px; right:14px;
+    font-family:'Courier New', monospace;
+    font-size:.9rem; font-weight:bold;
+    letter-spacing:4px; color:#fff;
+    opacity:0;
+    transition: opacity .4s, text-shadow .8s;
+    z-index:10; pointer-events:none;
+  }
+
+  #startOverlay {
+    position:absolute; inset:0;
+    display:flex; align-items:center; justify-content:center;
+    background:rgba(0,0,0,.7);
+    z-index:20; transition:opacity .5s;
+  }
+  #startBtn {
+    padding:12px 32px;
+    background:transparent;
+    border:1px solid #fff; color:#fff;
+    font-family:'Courier New', monospace;
+    font-size:.8rem; letter-spacing:4px; cursor:pointer;
+    transition:background .3s;
+  }
+  #startBtn:hover { background:rgba(255,255,255,.15); }
+  #startBtn:disabled { opacity:.4; cursor:not-allowed; }
+
+  #particleCanvas { width:100%; height:100%; display:block; }
+
+  #moodTagP {
+    position:absolute; top:10px; right:14px;
+    font-family:'Courier New', monospace;
+    font-size:.9rem; font-weight:bold;
+    letter-spacing:4px; color:#fff;
+    text-shadow:0 0 12px #ff69b4;
+    transition:text-shadow .8s;
+    z-index:10; pointer-events:none;
+  }
+</style>
+</head>
+<body>
+
+<div class="panel" id="topPanel">
+  <video id="videoEl" autoplay muted playsinline></video>
+  <canvas id="overlayCanvas"></canvas>
+
+  <div id="startOverlay">
+    <button id="startBtn" disabled>loading...</button>
+  </div>
+</div>
+
+<div class="panel" id="bottomPanel">
+  <canvas id="particleCanvas"></canvas>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js"></script>
+<script>
+const MOODS = {
+  happy:     { hex:'#ff69b4', rgb:[255,105,180], label:'happy'     },
+  angry:     { hex:'#ff4500', rgb:[255,69,0],    label:'angry'     },
+  sad:       { hex:'#00e676', rgb:[0,230,118],   label:'sad'       },
+  fearful:   { hex:'#7c4dff', rgb:[124,77,255],  label:'fearful'   },
+  surprised: { hex:'#ffd700', rgb:[255,215,0],   label:'surprised' },
+  neutral:   { hex:'#00bcd4', rgb:[0,188,212],   label:'neutral'   },
+  disgusted: { hex:'#607d8b', rgb:[96,125,139],  label:'disgusted' },
+};
+
+let currentMood = 'neutral';
+let targetRgb   = [0,188,212];
+let lerpRgb     = [0,188,212];
+
+function setMood(key) {
+  if (!MOODS[key]) key = 'neutral';
+  if (key === currentMood) return;
+  currentMood = key;
+  const m = MOODS[key];
+  targetRgb = [...m.rgb];
+  document.getElementById('moodTag').style.textShadow = `0 0 12px ${m.hex}`;
+  document.getElementById('moodTag').textContent  = m.label;
+  document.getElementById('moodTag').style.opacity = '1';
+  document.getElementById('moodTagP').textContent = m.label;
+  document.getElementById('moodTagP').style.textShadow = `0 0 12px ${m.hex}`;
+}
+
+const SMOOTH = 6, hist = [];
+function smooth(raw) {
+  hist.push({...raw});
+  if (hist.length > SMOOTH) hist.shift();
+  const avg = {};
+  Object.keys(raw).forEach(k => {
+    avg[k] = hist.reduce((s,e) => s+(e[k]||0), 0) / hist.length;
+  });
+  return avg;
+}
+
+const pCanvas = document.getElementById('particleCanvas');
+const pCtx    = pCanvas.getContext('2d');
+const N = 1800;
+const pts = [];
+let normBox = null;
+
+function resizeP() {
+  pCanvas.width  = document.getElementById('bottomPanel').clientWidth;
+  pCanvas.height = document.getElementById('bottomPanel').clientHeight;
+}
+
+class P {
+  constructor(init) {
+    this.x  = Math.random() * pCanvas.width;
+    this.y  = init ? Math.random() * pCanvas.height : (Math.random()<.5 ? -4 : pCanvas.height+4);
+    this.vx = (Math.random()-.5)*.45;
+    this.vy = (Math.random()-.5)*.45;
+    this.r  = Math.random()*.7+.2;
+    this.a  = Math.random()*.65+.25;
+    this.ang = Math.random()*Math.PI*2;
+    this.orb = (Math.random()-.5)*.022;
+  }
+  tick() {
+    this.ang += this.orb;
+    this.x += this.vx + Math.cos(this.ang)*.28;
+    this.y += this.vy + Math.sin(this.ang)*.28;
+    if (normBox) {
+      const cx=(normBox.x+normBox.w*.5)*pCanvas.width;
+      const cy=(normBox.y+normBox.h*.5)*pCanvas.height;
+      const d=Math.hypot(cx-this.x, cy-this.y);
+      if (d<200) { this.x+=(cx-this.x)*.001; this.y+=(cy-this.y)*.001; }
+    }
+    if(this.x<-6) this.x=pCanvas.width+6;
+    if(this.x>pCanvas.width+6) this.x=-6;
+    if(this.y<-6) this.y=pCanvas.height+6;
+    if(this.y>pCanvas.height+6) this.y=-6;
+  }
+  draw() {
+    const [r,g,b]=lerpRgb;
+    const grd=pCtx.createRadialGradient(this.x,this.y,0,this.x,this.y,this.r*3);
+    grd.addColorStop(0,`rgba(${r},${g},${b},${this.a})`);
+    grd.addColorStop(1,`rgba(${r},${g},${b},0)`);
+    pCtx.beginPath(); pCtx.arc(this.x,this.y,this.r*3,0,Math.PI*2);
+    pCtx.fillStyle=grd; pCtx.fill();
+    pCtx.beginPath(); pCtx.arc(this.x,this.y,this.r*.4,0,Math.PI*2);
+    pCtx.fillStyle=`rgba(255,255,255,${this.a*.85})`; pCtx.fill();
+  }
+}
+
+function initPts() {
+  resizeP(); pts.length=0;
+  for(let i=0;i<N;i++) pts.push(new P(true));
+}
+
+function drawLines() {
+  const [r,g,b]=lerpRgb;
+  for(let i=0;i<N;i+=4){
+    for(let j=i+1;j<N;j+=4){
+      const dx=pts[i].x-pts[j].x, dy=pts[i].y-pts[j].y;
+      const d=Math.hypot(dx,dy);
+      if(d<45){
+        pCtx.beginPath();
+        pCtx.strokeStyle=`rgba(${r},${g},${b},${(1-d/45)*.18})`;
+        pCtx.lineWidth=.4;
+        pCtx.moveTo(pts[i].x,pts[i].y);
+        pCtx.lineTo(pts[j].x,pts[j].y);
+        pCtx.stroke();
+      }
+    }
+  }
+}
+
+function lerp(a,b,t){return a+(b-a)*t;}
+
+function renderPts() {
+  lerpRgb=[lerp(lerpRgb[0],targetRgb[0],.04),lerp(lerpRgb[1],targetRgb[1],.04),lerp(lerpRgb[2],targetRgb[2],.04)];
+  pCtx.fillStyle='rgba(0,0,0,.2)'; pCtx.fillRect(0,0,pCanvas.width,pCanvas.height);
+  const [r,g,b]=lerpRgb;
+  const ag=pCtx.createRadialGradient(pCanvas.width*.5,pCanvas.height*.5,0,pCanvas.width*.5,pCanvas.height*.5,pCanvas.width*.75);
+  ag.addColorStop(0,`rgba(${r},${g},${b},.06)`); ag.addColorStop(1,'transparent');
+  pCtx.fillStyle=ag; pCtx.fillRect(0,0,pCanvas.width,pCanvas.height);
+  drawLines();
+  for(const p of pts){p.tick();p.draw();}
+
+  requestAnimationFrame(renderPts);
+}
+
+const video   = document.getElementById('videoEl');
+const oCanvas = document.getElementById('overlayCanvas');
+const oCtx    = oCanvas.getContext('2d');
+
+const CDNS = [
+  'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights',
+  'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@master/weights',
+  'https://vladmandic.github.io/face-api/model',
+];
+
+async function loadModels() {
+  const btn = document.getElementById('startBtn');
+  for(const url of CDNS){
+    try {
+      await faceapi.nets.tinyFaceDetector.loadFromUri(url);
+      await faceapi.nets.faceExpressionNet.loadFromUri(url);
+      btn.textContent='tap to start'; btn.disabled=false; return;
+    } catch(e){ console.warn('CDN failed',url); }
+  }
+  btn.textContent='retry'; btn.disabled=false; btn.onclick=loadModels;
+}
+
+document.getElementById('startBtn').addEventListener('click', startCam);
+
+async function startCam() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}}});
+    video.srcObject=s;
+    await new Promise(r=>video.addEventListener('loadedmetadata',r,{once:true}));
+    oCanvas.width=video.videoWidth||640; oCanvas.height=video.videoHeight||480;
+    const ov=document.getElementById('startOverlay');
+    ov.style.opacity='0'; setTimeout(()=>{ov.style.display='none';},500);
+    loop();
+  } catch(e){ document.getElementById('startBtn').textContent='camera denied'; }
+}
+
+async function loop() {
+  if(!video.paused&&!video.ended){
+    try{
+      const opts=new faceapi.TinyFaceDetectorOptions({inputSize:416,scoreThreshold:0.3});
+      const det=await faceapi.detectSingleFace(video,opts).withFaceExpressions();
+      oCtx.clearRect(0,0,oCanvas.width,oCanvas.height);
+      if(det){
+        const box=det.detection.box;
+        const fx=oCanvas.width-box.x-box.width;
+
+        const exprs=smooth(det.expressions);
+        const sorted=Object.entries(exprs).sort((a,b)=>b[1]-a[1]);
+        let topKey=sorted[0][0];
+        if(topKey==='neutral'&&sorted[1]&&sorted[1][1]>0.12) topKey=sorted[1][0];
+        setMood(topKey);
+        normBox={x:box.x/oCanvas.width,y:box.y/oCanvas.height,w:box.width/oCanvas.width,h:box.height/oCanvas.height};
+      } else { normBox=null; }
+    }catch(e){}
+  }
+  setTimeout(loop,140);
+}
+
+window.addEventListener('resize',()=>{ resizeP(); pts.length=0; for(let i=0;i<N;i++) pts.push(new P(true)); });
+initPts(); renderPts(); setMood('neutral'); loadModels();
+</script>
+</body>
+</html>
